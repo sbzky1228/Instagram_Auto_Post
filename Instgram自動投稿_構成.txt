@@ -1,0 +1,231 @@
+テーマ：Instagram自動投稿（Instagram Graph API）
+使用言語：C#（.NET）
+
+====================
+1. 目的 / ゴール
+====================
+- Instagramフィード投稿（画像1枚）を、キューに基づいて自動投稿する
+- 失敗時に原因を追える（ログ・ステータス・再実行）
+- 安全に運用できる（トークン管理、上限・リトライ、監視）
+
+====================
+2. 前提 / 制約（必ず仕様に明記）
+====================
+- Instagram Graph API（Content Publishing）を使用
+- 投稿は「メディアコンテナ作成 → 公開」の2段階
+- 画像はAPIに直接アップロードできない前提（Meta側が image_url を取得）
+  → 画像はHTTPSで直接取得できる“公開URL”が必要
+- Instagramアカウントはプロアカウント（Business/Creator）であること
+- Metaアプリ設定、権限（instagram_content_publish 等）取得が必要
+- 投稿上限（publishing limit）が存在 → 実行前に確認する
+- APIバージョン固定（vXX.X）し、更新手順を用意する
+
+====================
+3. 入出力仕様（データ定義）
+====================
+[投稿キュー（1レコード）]
+- PostId: GUID
+- Type: IMAGE（MVPはIMAGEのみ）
+- Caption: string
+- LocalImagePath: string（ローカル生成/保管の場合）
+- SourceImageUrl: string（すでに公開URLがある場合）
+- ScheduledAtJst: datetime
+- Status: enum
+  - QUEUED / UPLOADED / CONTAINER_CREATED / PUBLISHING / PUBLISHED / FAILED / RETRY
+- MediaPublicUrl: string（Graph APIへ渡す最終URL）
+- IgContainerId: string
+- IgMediaId: string
+- Attempts: int
+- LastErrorCode: string
+- LastErrorMessage: string
+- CreatedAt / UpdatedAt
+
+[ログ]
+- 実行ID（RunId）、対象PostId、HTTPステータス、レスポンス本文（マスク後）、
+  例外スタック、処理時間、リトライ回数
+
+====================
+4. 画像ホスティング仕様（重要）
+====================
+- image_url は外部からGET可能（200 OK）で、画像バイナリが返ること
+- 推奨：AWS S3
+  - パターンA：Public Read（公開URL）
+  - パターンB：署名付きURL（期限1〜6時間程度）
+- 実行前検証：
+  - HEAD/GETで 200 OK
+  - Content-Type: image/*（image/jpeg, image/png）
+  - 画像サイズ/容量（上限を別途ルール化）
+- Google Driveは「共有リンク=直画像URL」にならない場合が多く不安定
+  → “配信元”としては非推奨（保管庫として使うなら可）
+
+====================
+5. 処理フロー仕様（状態遷移）
+====================
+0) 事前チェック
+- 現在時刻（JST）で、ScheduledAtJst <= now の QUEUED を取得
+- publishing limit 取得し、上限超過なら停止（FAILEDにせず保留）
+- トークン有効期限チェック（期限近いなら警告/停止）
+
+1) Upload（必要な場合）
+- LocalImagePath がある場合：
+  - S3へアップロード
+  - MediaPublicUrl を確定
+  - Status=UPLOADED
+
+2) Create Container
+- POST /{ig-user-id}/media
+  - image_url = MediaPublicUrl
+  - caption = Caption
+- 成功：
+  - IgContainerId 保存
+  - Status=CONTAINER_CREATED
+- 失敗：
+  - 4xx → FAILED（原則）
+  - 5xx/一時障害 → RETRY
+
+3) Publish
+- POST /{ig-user-id}/media_publish
+  - creation_id = IgContainerId
+- 成功：
+  - IgMediaId 保存
+  - Status=PUBLISHED
+- 失敗：
+  - 4xx → FAILED
+  - 5xx/一時障害 → RETRY
+
+4) Retry（指数バックオフ）
+- RETRY対象：ネットワーク例外、429、5xx 等
+- 最大回数：例 5回
+- 待機：例 5s→15s→45s→135s…（上限設定）
+- 失敗が続く場合：FAILEDへ遷移し通知
+
+====================
+6. トークン管理仕様（運用の肝）
+====================
+- Long-lived access token（有効期限 約60日）を前提
+- appsettings / .env などに保存（Git管理しない）
+- TokenExpiresAt を保持して、残り7日で通知
+- 更新手順を手順書化（半自動/手動）
+- ログ出力時はトークンをマスク（先頭/末尾のみ）
+
+====================
+7. システム構成（C# / .NET）
+====================
+[実行形態]
+- Console App（.NET 8 など）
+- 定期実行：Windowsタスクスケジューラ / cron / GitHub Actions等
+
+[モジュール]
+- Config
+  - appsettings.json + UserSecrets / .env
+- QueueStore
+  - (A) SQLite（推奨：軽量で堅い）
+  - (B) Google Sheets（運用しやすいがAPI障害考慮）
+  - (C) CSV（最小だが同時実行に弱い）
+- MediaHost
+  - S3Uploader（AWS SDK）
+- GraphApiClient
+  - HttpClient（再試行ポリシー、タイムアウト、レート制御）
+- PublisherService
+  - 状態遷移ロジック、バリデーション、冪等性制御
+- Notifier
+  - LINE/Slack/メール（任意）
+- Logging
+  - Serilog等（JSONログ推奨）
+
+[ディレクトリ例]
+- src/
+  - InstagramAutoPoster/
+    - Program.cs
+    - Config/
+    - Domain/（Post, Status 等）
+    - Infrastructure/
+      - QueueStore/
+      - AwsS3/
+      - MetaGraphApi/
+      - Notifications/
+    - Services/
+      - PublisherService.cs
+      - ValidationService.cs
+    - Logs/
+- docs/
+  - runbook.md（運用手順）
+  - setup_meta_app.md（Meta設定手順）
+
+====================
+8. 非機能要件
+====================
+- 冪等性（同一PostIdの二重投稿防止）
+  - Status=PUBLISHEDは再実行でもスキップ
+  - IgMediaIdがある場合はpublishを行わない
+- 競合防止
+  - 同時起動対策（ロックファイル or DBロック）
+- タイムアウト
+  - HttpClient Timeout（例 30s）
+  - 全体処理の最大時間（例 10分）
+- セキュリティ
+  - 秘密情報はSecret管理
+  - ログに個人情報/トークン/URL署名を漏らさない
+- 監視
+  - 連続失敗（例 3件以上）で通知
+  - 成功/失敗件数サマリを通知
+
+====================
+9. コンフィグ項目（例）
+====================
+- Meta:
+  - GraphApiBaseUrl=https://graph.facebook.com
+  - GraphApiVersion=vXX.X
+  - AccessToken=...
+  - IgUserId=...
+- MediaHost(S3):
+  - BucketName=...
+  - Region=...
+  - UsePresignedUrl=true/false
+  - PresignedUrlExpiryMinutes=180
+  - KeyPrefix=instagram/
+- Publisher:
+  - PollIntervalMinutes=5（定期実行間隔）
+  - MaxAttempts=5
+  - BackoffBaseSeconds=5
+  - CaptionMaxLength=xxxx（仕様で固定）
+  - AllowedImageTypes=jpg,png
+- Notification:
+  - LineChannelToken=...（任意）
+  - NotifyOnSuccess=true/false
+  - NotifyOnFailure=true
+
+====================
+10. テスト仕様（最低限）
+====================
+- Unit
+  - Captionバリデーション（長さ、禁止文字）
+  - URL到達性チェック（200、Content-Type）
+  - 状態遷移（QUEUED→PUBLISHED）
+- Integration（ステージング推奨）
+  - /media 作成の成功・失敗
+  - /media_publish の成功・失敗
+  - 429/5xx時のリトライ
+- 手動運用テスト
+  - トークン更新後の動作確認
+  - 署名付きURL期限切れ時の挙動
+
+====================
+11. 今後の拡張（MVP後）
+====================
+- カルーセル（複数画像）
+- Reels/動画投稿（処理完了待ち、制限対応）
+- 投稿テンプレ（定型文/ハッシュタグ自動生成）
+- 画像生成パイプライン（Canva/自作）→ S3 → 投稿
+- 管理UI（投稿一覧、再実行ボタン、失敗原因表示）
+- 複数アカウント対応（IGUserId/Tokenを複数管理）
+
+====================
+12. 例外・失敗パターン（よくある）
+====================
+- 権限不足（instagram_content_publish等）
+- image_url が公開されていない（401/403/HTML返却）
+- 画像URLの期限切れ（署名付きURL）
+- publishing limit 超過
+- レート制限（429）
+- Meta側障害（5xx）

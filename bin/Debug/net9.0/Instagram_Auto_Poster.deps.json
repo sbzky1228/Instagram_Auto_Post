@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v9.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v9.0": {
+      "Instagram_Auto_Poster/1.0.0": {
+        "runtime": {
+          "Instagram_Auto_Poster.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Instagram_Auto_Poster/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
